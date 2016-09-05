@@ -1,0 +1,133 @@
+#!/bin/bash
+set -e
+
+install_dir=$(cd $(dirname $0);pwd)/clair
+
+function __usage() {
+  cat <<-EOF
+Usage: 
+    analysis <Docker Image ID>
+EOF
+}
+
+function __is_executable() {
+    local cmd="$1"
+    type "${cmd}" > /dev/null 2>&1
+}
+
+function __init_clair() {
+    mkdir -p ${install_dir}/clair_config
+
+    if [ ! -f ${install_dir}/docker-compose.yml ]; then
+        local url="https://raw.githubusercontent.com/coreos/clair/v1.2.2/docker-compose.yml"
+        curl -L ${url} -o ${install_dir}/docker-compose.yml
+    fi
+
+    if [ ! -f ${install_dir}/clair_config/config.yaml ]; then
+        local url="https://raw.githubusercontent.com/coreos/clair/v1.2.2/config.example.yaml"
+        curl -L ${url} -o ${install_dir}/clair_config/config.yaml
+        sed -i -e "s/source:/source: postgresql:\/\/postgres:password@postgres:5432\?sslmode=disable/" \
+            ${install_dir}/clair_config/config.yaml
+    fi 
+}
+
+#function __init_clair_analysis_tool() {
+#    if ! docker images | grep clair_analysis_tool > /dev/null 2>&1; then
+#        docker build -t clair_analysis_tool analysis_tool/ 
+#    fi
+#}
+
+function __up_clair() {
+    docker-compose -f ${install_dir}/docker-compose.yml up -d postgres
+    docker exec -it clair_postgres ps aux \
+        | awk '{print $11}' | grep postgres | grep -v : > /dev/null 2>&1; status=$?
+
+    if [ ${status} -ne 0 ]; then
+        printf "wait."
+    fi
+
+    while [ ${status} -ne 0 ]; do
+        printf "."; sleep 1
+        docker exec -it clair_postgres ps aux | \
+            awk '{print $11}' | grep postgres | grep -v : > /dev/null 2>&1; status=$?
+        if [ ${status} -eq 0 ]; then
+            echo "done"
+        fi
+    done
+    docker-compose -f clair/docker-compose.yml up -d clair
+}
+
+function __up_analysis_tool() {
+    if ! docker ps | grep clair_analysis_tool > /dev/null 2>&1; then
+        tool_id=$(docker run --name clair_analysis_tool -v /var/run/docker.sock:/var/run/docker.sock -itd nutsllc/clair-analysis-tool:1.0.0)
+        docker network connect clair_default ${tool_id}
+    fi
+}
+
+function __init() {
+    __init_clair
+}
+
+function __up() {
+    __up_clair && __up_analysis_tool
+}
+
+function __clean() {
+    clair_id=$(docker ps | grep "clair_clair" | awk '{print $1}')
+    clair_postgres_id=$(docker ps | grep "clair_postgres" | awk '{print $1}')
+    clair_analysis_tool=$(docker ps | grep "clair_analysis_tool" | awk '{print $1}')
+    docker stop ${clair_id} ${clair_postgres_id} ${clair_analysis_tool} > /dev/null 2>&1
+    docker rm ${clair_id} ${clair_postgres_id} ${clair_analysis_tool} > /dev/null 2>&1
+}
+
+function __exit1() {
+    printf "error: "; $1
+    __clean
+    exit 1;
+}
+
+function __exec() {
+    if [ $# -ne 1 ]; then
+        echo "Image ID is not specify."; exit 1
+    else
+        image_id=$1
+    fi
+
+    __init || {
+        echo "initialize error occurd."; exit 1
+    }
+    __up || {
+        echo "initialize error occurd."; exit 1
+    }
+
+    filter="{{ .NetworkSettings.Networks.clair_default.IPAddress }}"
+    clair_ip=$(docker inspect -f "${filter}" clair_clair)
+    analysis_tool_ip=$(docker inspect -f "${filter}" clair_analysis_tool) 
+
+    script="analyze-local-images -endpoint http://${clair_ip}:6060 -my-address ${analysis_tool_ip} ${image_id}"
+    docker exec -it clair_analysis_tool sh -c "${script}" && {
+        : #__clean
+    }
+}
+
+# --------------------------------
+# error check
+# --------------------------------
+__is_executable docker || {
+    cat <<EOF
+"docker" is required.
+See: https://docs.docker.com/installation/#installation
+EOF
+    exit 1
+}
+
+# --------------------------------
+# main
+# --------------------------------
+if [ $1 = "help" ]; then
+    echo "help"
+else
+    __exec $@
+fi
+
+exit 0
